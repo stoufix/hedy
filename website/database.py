@@ -33,11 +33,14 @@ import sys
 from os import path
 
 from utils import timems, times
+import utils
+from config import config
 
 from . import dynamo, auth
 
 from .dynamo import DictOf, OptionalOf, ListOf, SetOf, RecordOf, EitherOf
 
+from hedy_content import MAX_LEVEL
 
 is_offline = getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
 
@@ -473,6 +476,22 @@ class Database:
             key = program.get('adventure_name', 'default')
             if key not in ret or ret[key]['date'] < program['date']:
                 ret[key] = program
+        return ret
+
+    def last_programs_for_user_all_levels(self, username):
+        """Return the most recent programs for the given user for all levels.
+
+        Returns: { level -> { adventure_name -> { code, name, ... } } }
+        """
+        programs = self.programs_for_user(username)
+        ret = {i: {} for i in range(1, MAX_LEVEL + 1)}
+        for program in programs:
+            if 'adventure_name' not in program or 'level' not in program:
+                continue
+            key = program['adventure_name']
+            level = program['level']
+            if key not in ret[level] or ret[level][key]['date'] < program['date']:
+                ret[level][key] = program
         return ret
 
     def programs_for_user(self, username):
@@ -1008,7 +1027,16 @@ class Database:
     def get_user_class_invite(self, username, class_id):
         return self.invitations.get({"username#class_id": f"{username}#{class_id}"}) or None
 
-    def add_class_invite(self, data):
+    def add_class_invite(self, username: str, class_id: str, invited_as: str, invited_as_text: str):
+        invite_length = config["session"]["invite_length"] * 60
+        data = {
+            "username": username,
+            "class_id": class_id,
+            "timestamp": utils.times(),
+            "ttl": utils.times() + invite_length,
+            "invited_as": invited_as,
+            "invited_as_text": invited_as_text,
+        }
         data['username#class_id'] = data['username'] + '#' + data['class_id']
         self.invitations.put(data)
 
@@ -1228,24 +1256,38 @@ class Database:
         Gets students that aren't already in a class
         """
         return self.users.get_many(
-            {"epoch": 1, "username": dynamo.BeginsWith(search)},
+            {"epoch": CURRENT_USER_EPOCH, "username": dynamo.BeginsWith(search)},
             server_side_filter={"classes": dynamo.SetEmpty()},
             limit=10,
         )
 
-    def get_teacher_that_starts_with(self, search, class_id=None):
+    def get_teacher_that_starts_with(self, search, not_in_class_id=None):
         """
         Gets teachers from DB that aren't second teacher's already of this class
         """
-        server_side_filter = {'is_teacher': dynamo.Equals(1)}
-        if class_id:
-            server_side_filter['second_teacher_in'] = dynamo.NotContains(class_id)
+        server_side_filter = {'is_teacher': 1}
+        if not_in_class_id:
+            server_side_filter['second_teacher_in'] = dynamo.NotContains(not_in_class_id)
         records = self.users.get_many(
-            {"epoch": 1, "username": dynamo.BeginsWith(search)},
+            {"epoch": CURRENT_USER_EPOCH, "username": dynamo.BeginsWith(search)},
             server_side_filter=server_side_filter,
             limit=10
         )
         return records
+
+    def get_class_invites(self, class_id: str):
+        invites = []
+        for invite in self.get_class_invitations(class_id):
+            invites.append(
+                {
+                    "username": invite["username"],
+                    "invited_as_text": invite["invited_as_text"],
+                    "invited_as": invite["invited_as"],
+                    "timestamp": utils.localized_date_format(invite["timestamp"], short_format=True),
+                    "expire_timestamp": utils.localized_date_format(invite["ttl"], short_format=True),
+                }
+            )
+        return invites
 
 
 def batched(iterable, n):
